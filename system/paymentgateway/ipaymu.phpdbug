@@ -1,0 +1,135 @@
+<?php
+
+require_once __DIR__ . '/ipaymu_debug.php';
+
+function ipaymu_validate_config()
+{
+    global $config;
+
+    if (empty($config['ipaymu_va']) || empty($config['ipaymu_api_key'])) {
+        r2(U . 'order/package', 'e', "iPaymu not configured.");
+    }
+}
+
+function ipaymu_create_transaction($trx, $user)
+{
+    global $config;
+
+    // =========================
+    // STEP 1: JIKA BELUM PILIH CHANNEL
+    // =========================
+    if (!isset($_POST['payment_channel'])) {
+
+        echo '
+        <h3>Select Payment Method</h3>
+        <form method="POST">
+            <select name="payment_channel" required>
+                <option value="">-- Select Channel --</option>
+                <option value="va_bri">VA BRI</option>
+                <option value="va_bca">VA BCA</option>
+                <option value="qris_mpm">QRIS</option>
+            </select>
+            <br><br>
+            <button type="submit">Pay Now</button>
+        </form>
+        ';
+        exit;
+    }
+
+    // =========================
+    // STEP 2: PROSES DIRECT API
+    // =========================
+
+    list($paymentMethod, $paymentChannel) = explode('_', $_POST['payment_channel']);
+
+    $va     = $config['ipaymu_va'];
+    $apiKey = $config['ipaymu_api_key'];
+    $mode   = $config['ipaymu_mode'] ?? 'sandbox';
+
+    $url = ($mode == 'sandbox')
+        ? 'https://sandbox.ipaymu.com/api/v2/payment/direct'
+        : 'https://my.ipaymu.com/api/v2/payment/direct';
+
+    $body = [
+        'name'           => trim($user['fullname'] ?: 'TEST USER'),
+        'phone'          => trim($user['phonenumber'] ?: '081234567890'),
+        'email'          => trim($user['email'] ?: 'test@gmail.com'),
+        'amount'         => floatval($trx['price']),
+        'notifyUrl'      => U . 'callback/ipaymu',
+        'referenceId'    => (string)$trx['id'],
+        'paymentMethod'  => trim($paymentMethod),
+        'paymentChannel' => trim($paymentChannel)
+    ];
+
+    $jsonBody     = json_encode($body, JSON_UNESCAPED_SLASHES);
+    $requestBody  = strtolower(hash('sha256', $jsonBody));
+    $stringToSign = strtoupper('POST') . ':' . $va . ':' . $requestBody . ':' . $apiKey;
+    $signature    = hash_hmac('sha256', $stringToSign, $apiKey);
+    $timestamp    = date('YmdHis');
+
+    $headers = [
+        'Accept: application/json',
+        'Content-Type: application/json',
+        'va: ' . $va,
+        'signature: ' . $signature,
+        'timestamp: ' . $timestamp
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonBody);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+
+    $response = curl_exec($ch);
+    $error    = curl_error($ch);
+    curl_close($ch);
+
+    // DEBUG LOG REQUEST + RESPONSE
+    ipaymu_debug_log([
+        'request'  => $body,
+        'response' => $response,
+        'error'    => $error
+    ]);
+
+    if ($error) {
+        die("CURL ERROR: " . $error);
+    }
+
+    $result = json_decode($response, true);
+
+    if (empty($result['Success']) || $result['Success'] != true) {
+        die("<pre>API ERROR:\n" . $response . "</pre>");
+    }
+
+    $data = $result['Data'];
+
+    $d = ORM::for_table('tbl_payment_gateway')
+        ->where('id', $trx['id'])
+        ->find_one();
+
+    $d->gateway = 'ipaymu';
+    $d->gateway_trx_id = $data['referenceId'] ?? $trx['id'];
+    $d->payment_method = $paymentMethod;
+    $d->payment_channel = $paymentChannel;
+    $d->pg_request = $response;
+    $d->expired_date = $data['expired'] ?? date('Y-m-d H:i:s', strtotime("+1 day"));
+
+    if (isset($data['vaNumber'])) {
+        $d->pg_url_payment = $data['vaNumber'];
+    }
+
+    if (isset($data['qrString'])) {
+        $d->pg_url_payment = $data['qrString'];
+    }
+
+    $d->save();
+
+    echo "<h3>Payment Created</h3>";
+    echo "<pre>";
+    print_r($data);
+    echo "</pre>";
+    exit;
+}
